@@ -12,26 +12,40 @@ function getAuthHeader(): string {
   return `Basic ${credentials}`;
 }
 
-// Base fetch wrapper — disables SSL cert verification (self-signed cert on router)
-// Uses Node.js native fetch (Next.js 13+ supports this server-side)
+// Base fetch wrapper — uses Node.js https module to support rejectUnauthorized: false
+// Required because MikroTik uses a self-signed certificate
 async function mikrotikFetch(endpoint: string): Promise<any> {
   const url = `https://${MIKROTIK_HOST}${endpoint}`;
 
-  const response = await fetch(url, {
-    headers: {
-      Authorization: getAuthHeader(),
-      "Content-Type": "application/json",
-    },
-    // @ts-ignore — Node.js fetch option, not in standard TS types
-    agent: new (require("https").Agent)({ rejectUnauthorized: false }),
-    cache: "no-store",
+  return new Promise((resolve, reject) => {
+    const https = require("https");
+    const options = {
+      headers: {
+        Authorization: getAuthHeader(),
+      },
+      rejectUnauthorized: false, // self-signed cert on MikroTik
+    };
+
+    https.get(url, options, (res: any) => {
+      let data = "";
+
+      res.on("data", (chunk: string) => { data += chunk; });
+
+      res.on("end", () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`MikroTik API error: ${res.statusCode} — ${endpoint}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          reject(new Error(`Failed to parse MikroTik response from ${endpoint}`));
+        }
+      });
+    }).on("error", (err: Error) => {
+      reject(err);
+    });
   });
-
-  if (!response.ok) {
-    throw new Error(`MikroTik API error: ${response.status} ${response.statusText}`);
-  }
-
-  return response.json();
 }
 
 // --- Data fetchers ---
@@ -54,23 +68,23 @@ export async function getAccountingSnapshot(): Promise<MikroTikAccountingEntry[]
 // System uptime, CPU load, memory usage, board name
 export async function getSystemResource(): Promise<MikroTikSystemResource> {
   const data = await mikrotikFetch("/rest/system/resource");
-  return data[0] ?? data; // RouterOS returns array for most endpoints, object for this one
+  return Array.isArray(data) ? data[0] : data;
 }
 
 // Convenience: fetch all four in parallel — used by the SSE handler
+// Uses allSettled so one failing endpoint doesn't kill the entire snapshot
 export async function getAllNetworkData(): Promise<NetworkSnapshot> {
-  const [interfaces, leases, accounting, system] = await Promise.all([
+  const [interfaces, leases, system] = await Promise.allSettled([
     getInterfaces(),
     getDhcpLeases(),
-    getAccountingSnapshot(),
     getSystemResource(),
   ]);
 
   return {
-    interfaces,
-    leases,
-    accounting,
-    system,
+    interfaces: interfaces.status === "fulfilled" ? interfaces.value : [],
+    leases: leases.status === "fulfilled" ? leases.value : [],
+    accounting: [], // IP Accounting not available on RouterOS 7 CCR
+    system: system.status === "fulfilled" ? system.value : {} as MikroTikSystemResource,
     timestamp: Date.now(),
   };
 }
@@ -101,17 +115,17 @@ export interface MikroTikDhcpLease {
 }
 
 export interface MikroTikAccountingEntry {
-  src: string;      // source IP
-  dst: string;      // destination IP
+  src: string;
+  dst: string;
   bytes: string;
   packets: string;
 }
 
 export interface MikroTikSystemResource {
   uptime: string;
-  "cpu-load": string;       // percentage as string e.g. "12"
-  "free-memory": string;    // bytes as string
-  "total-memory": string;   // bytes as string
+  "cpu-load": string;
+  "free-memory": string;
+  "total-memory": string;
   "board-name": string;
   version: string;
 }

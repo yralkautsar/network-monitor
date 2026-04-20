@@ -1,60 +1,48 @@
 // app/dashboard/network/page.tsx
-// Network monitoring dashboard — consumes SSE stream from /api/network-stream
-// Sections: system overview, interfaces, connected clients, traffic per IP
+// Network Monitor — Option C: minimal light, data-first, no nav chrome
+// Layout: metric cards left | active interfaces right | bandwidth full width | clients table
 
 "use client";
 
 import { useNetworkStream } from "@/hooks/useNetworkStream";
-import type { MikroTikInterface, MikroTikDhcpLease, MikroTikAccountingEntry } from "@/lib/mikrotik";
-import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-} from "recharts";
-import { useRef, useState } from "react";
+import type { MikroTikInterface, MikroTikDhcpLease } from "@/lib/mikrotik";
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import { useRef, useState, useEffect } from "react";
 
 // --- Helpers ---
 
-// Converts bytes string to human-readable format
 function formatBytes(bytes: string | number): string {
   const n = typeof bytes === "string" ? parseInt(bytes, 10) : bytes;
   if (isNaN(n)) return "—";
+  if (n >= 1_000_000_000_000) return `${(n / 1_000_000_000_000).toFixed(2)} TB`;
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)} GB`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)} MB`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(2)} KB`;
   return `${n} B`;
 }
 
-// Converts bps string to Mbps or Kbps
 function formatRate(bps: string | number): string {
   const n = typeof bps === "string" ? parseInt(bps, 10) : bps;
-  if (isNaN(n)) return "—";
+  if (isNaN(n) || n === 0) return "0 bps";
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)} Mbps`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(2)} Kbps`;
   return `${n} bps`;
 }
 
-// Formats RouterOS uptime string (e.g. "3d2h15m10s") into readable form
 function formatUptime(uptime: string): string {
   if (!uptime) return "—";
   return uptime.replace("d", "d ").replace("h", "h ").replace("m", "m ").trim();
 }
 
-// Returns Tailwind color class based on CPU load percentage
-function cpuColor(load: string): string {
-  const n = parseInt(load, 10);
-  if (n >= 80) return "text-red-500";
-  if (n >= 50) return "text-yellow-500";
-  return "text-green-500";
+function formatMemory(free: string, total: string): string {
+  const f = parseInt(free, 10);
+  const t = parseInt(total, 10);
+  if (isNaN(f) || isNaN(t)) return "—";
+  const usedPct = Math.round(((t - f) / t) * 100);
+  return `${formatBytes(t - f)} used · ${usedPct}%`;
 }
 
-// Max history entries kept for bandwidth sparkline chart
-const MAX_HISTORY = 30;
-
-// --- Types ---
+const MAX_HISTORY = 40;
 
 interface BandwidthPoint {
   time: string;
@@ -64,80 +52,144 @@ interface BandwidthPoint {
 
 // --- Sub-components ---
 
-// Status indicator badge for SSE connection state
-function StatusBadge({ status }: { status: string }) {
-  const styles: Record<string, string> = {
-    connected: "bg-green-100 text-green-700",
-    connecting: "bg-yellow-100 text-yellow-700",
-    reconnecting: "bg-orange-100 text-orange-700",
-    error: "bg-red-100 text-red-700",
+function StatusDot({ status }: { status: string }) {
+  const colors: Record<string, string> = {
+    connected: "bg-emerald-400",
+    connecting: "bg-amber-400",
+    reconnecting: "bg-orange-400",
+    error: "bg-red-400",
   };
   return (
-    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${styles[status] ?? styles.error}`}>
+    <span className="flex items-center gap-1.5 text-xs text-zinc-400">
+      <span className={`w-1.5 h-1.5 rounded-full ${colors[status] ?? "bg-red-400"}`} />
       {status}
     </span>
   );
 }
 
-// Single stat card — label + value
-function StatCard({ label, value, valueClass = "" }: { label: string; value: string; valueClass?: string }) {
+function MetricCard({
+  label,
+  value,
+  sub,
+  accent,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  accent?: string;
+}) {
   return (
-    <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl p-4">
-      <p className="text-xs text-zinc-500 uppercase tracking-wide mb-1">{label}</p>
-      <p className={`text-xl font-semibold ${valueClass}`}>{value}</p>
+    <div className="bg-white border border-zinc-100 rounded-xl p-4 dark:bg-zinc-900 dark:border-zinc-800">
+      <p className="text-[11px] uppercase tracking-widest text-zinc-400 mb-1">{label}</p>
+      <p className={`text-2xl font-medium ${accent ?? "text-zinc-900 dark:text-zinc-100"}`}>
+        {value}
+      </p>
+      {sub && <p className="text-xs text-zinc-400 mt-0.5">{sub}</p>}
     </div>
   );
 }
 
-// Interface row — shows name, status, tx/rx rate and cumulative bytes
-function InterfaceRow({ iface }: { iface: MikroTikInterface }) {
-  const isUp = iface.running === "true" && iface.disabled === "false";
+function InterfaceBar({
+  iface,
+  maxBytes,
+  isSelected,
+  onClick,
+}: {
+  iface: MikroTikInterface;
+  maxBytes: number;
+  isSelected: boolean;
+  onClick: () => void;
+}) {
+  const txBytes = parseInt(iface["tx-byte"], 10) || 0;
+  const rxBytes = parseInt(iface["rx-byte"], 10) || 0;
+  const txPct = maxBytes > 0 ? (txBytes / maxBytes) * 100 : 0;
+  const rxPct = maxBytes > 0 ? (rxBytes / maxBytes) * 100 : 0;
+  const txRate = parseInt(iface["tx-rate"], 10) || 0;
+  const rxRate = parseInt(iface["rx-rate"], 10) || 0;
+  const isLive = txRate > 0 || rxRate > 0;
 
   return (
-    <div className="flex items-center justify-between py-3 border-b border-zinc-100 dark:border-zinc-800 last:border-0">
-      <div className="flex items-center gap-3 min-w-0">
-        {/* Status dot */}
-        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${isUp ? "bg-green-500" : "bg-red-400"}`} />
-        <div className="min-w-0">
-          <p className="text-sm font-medium truncate">{iface.name}</p>
-          <p className="text-xs text-zinc-500">{iface.type}</p>
+    <div
+      onClick={onClick}
+      className={`group cursor-pointer rounded-lg px-3 py-2.5 transition-colors ${
+        isSelected
+          ? "bg-zinc-50 dark:bg-zinc-800"
+          : "hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
+      }`}
+    >
+      <div className="flex items-center justify-between mb-1.5">
+        <div className="flex items-center gap-2 min-w-0">
+          <span
+            className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+              iface.running === "true" ? "bg-emerald-400" : "bg-red-300"
+            }`}
+          />
+          <span className="text-sm font-medium text-zinc-800 dark:text-zinc-200 truncate">
+            {iface.name}
+          </span>
+          {isLive && (
+            <span className="text-[10px] text-emerald-500 font-medium flex-shrink-0">live</span>
+          )}
+        </div>
+        <div className="flex gap-4 text-right flex-shrink-0 ml-4">
+          <span className="text-xs font-mono text-zinc-500">{formatBytes(txBytes)}</span>
         </div>
       </div>
-      <div className="flex gap-6 text-right text-sm flex-shrink-0">
-        <div>
-          <p className="text-xs text-zinc-500">TX</p>
-          <p className="font-mono">{formatRate(iface["tx-rate"])}</p>
+
+      {/* TX bar */}
+      <div className="space-y-1">
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-zinc-400 w-4">TX</span>
+          <div className="flex-1 h-1 bg-zinc-100 dark:bg-zinc-700 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-400 rounded-full transition-all duration-500"
+              style={{ width: `${Math.max(txPct, 0.5)}%` }}
+            />
+          </div>
+          {isLive && (
+            <span className="text-[10px] font-mono text-zinc-400 w-20 text-right">
+              {formatRate(txRate)}
+            </span>
+          )}
         </div>
-        <div>
-          <p className="text-xs text-zinc-500">RX</p>
-          <p className="font-mono">{formatRate(iface["rx-rate"])}</p>
-        </div>
-        <div className="hidden md:block">
-          <p className="text-xs text-zinc-500">Total TX</p>
-          <p className="font-mono text-xs">{formatBytes(iface["tx-byte"])}</p>
-        </div>
-        <div className="hidden md:block">
-          <p className="text-xs text-zinc-500">Total RX</p>
-          <p className="font-mono text-xs">{formatBytes(iface["rx-byte"])}</p>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-zinc-400 w-4">RX</span>
+          <div className="flex-1 h-1 bg-zinc-100 dark:bg-zinc-700 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-violet-400 rounded-full transition-all duration-500"
+              style={{ width: `${Math.max(rxPct, 0.5)}%` }}
+            />
+          </div>
+          {isLive && (
+            <span className="text-[10px] font-mono text-zinc-400 w-20 text-right">
+              {formatRate(rxRate)}
+            </span>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-// DHCP lease row — connected client
-function LeaseRow({ lease }: { lease: MikroTikDhcpLease }) {
+function ClientRow({ lease }: { lease: MikroTikDhcpLease }) {
   const isBound = lease.status === "bound";
-
   return (
-    <div className="flex items-center justify-between py-3 border-b border-zinc-100 dark:border-zinc-800 last:border-0">
-      <div className="min-w-0">
-        <p className="text-sm font-medium truncate">{lease["host-name"] ?? "Unknown"}</p>
-        <p className="text-xs text-zinc-500 font-mono">{lease["mac-address"]}</p>
+    <div className="flex items-center justify-between py-2.5 border-b border-zinc-50 dark:border-zinc-800 last:border-0">
+      <div className="min-w-0 flex-1">
+        <p className="text-sm text-zinc-800 dark:text-zinc-200 truncate">
+          {lease["host-name"] ?? "Unknown"}
+        </p>
+        <p className="text-[11px] text-zinc-400 font-mono">{lease["mac-address"]}</p>
       </div>
-      <div className="flex items-center gap-4 flex-shrink-0">
-        <p className="font-mono text-sm">{lease.address}</p>
-        <span className={`text-xs px-2 py-0.5 rounded-full ${isBound ? "bg-green-100 text-green-700" : "bg-zinc-100 text-zinc-500"}`}>
+      <div className="flex items-center gap-3 flex-shrink-0 ml-4">
+        <span className="font-mono text-sm text-zinc-600 dark:text-zinc-400">{lease.address}</span>
+        <span
+          className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
+            isBound
+              ? "bg-emerald-50 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400"
+              : "bg-zinc-100 text-zinc-400 dark:bg-zinc-800"
+          }`}
+        >
           {lease.status}
         </span>
       </div>
@@ -145,78 +197,89 @@ function LeaseRow({ lease }: { lease: MikroTikDhcpLease }) {
   );
 }
 
-// Accounting row — traffic per IP pair
-function AccountingRow({ entry }: { entry: MikroTikAccountingEntry }) {
-  return (
-    <div className="flex items-center justify-between py-3 border-b border-zinc-100 dark:border-zinc-800 last:border-0">
-      <div className="flex items-center gap-2 min-w-0 text-sm font-mono">
-        <span className="truncate">{entry.src}</span>
-        <span className="text-zinc-400">→</span>
-        <span className="truncate">{entry.dst}</span>
-      </div>
-      <div className="flex gap-4 text-right flex-shrink-0">
-        <div>
-          <p className="text-xs text-zinc-500">Bytes</p>
-          <p className="text-sm font-mono">{formatBytes(entry.bytes)}</p>
-        </div>
-        <div>
-          <p className="text-xs text-zinc-500">Packets</p>
-          <p className="text-sm font-mono">{parseInt(entry.packets, 10).toLocaleString()}</p>
-        </div>
-      </div>
-    </div>
-  );
+// Groups leases by subnet prefix (e.g. "192.168.1")
+function groupBySubnet(leases: MikroTikDhcpLease[]): Record<string, MikroTikDhcpLease[]> {
+  return leases.reduce((acc, lease) => {
+    const parts = lease.address.split(".");
+    const subnet = parts.slice(0, 3).join(".");
+    if (!acc[subnet]) acc[subnet] = [];
+    acc[subnet].push(lease);
+    return acc;
+  }, {} as Record<string, MikroTikDhcpLease[]>);
 }
 
 // --- Main Page ---
 
 export default function NetworkDashboard() {
-  const { data, status, error, lastUpdated } = useNetworkStream();
+  const { data, status, lastUpdated } = useNetworkStream();
 
-  // Bandwidth history for sparkline — accumulates tx/rx rate snapshots
-  // Keyed by interface name so each interface gets its own chart history
   const historyRef = useRef<Record<string, BandwidthPoint[]>>({});
-
-  // Selected interface for bandwidth sparkline
   const [selectedIface, setSelectedIface] = useState<string | null>(null);
-
-  // Search filter for connected clients table
   const [clientSearch, setClientSearch] = useState("");
+  const [showInactive, setShowInactive] = useState(false);
+  const [, forceUpdate] = useState(0);
 
-  // Search filter for traffic table
-  const [trafficSearch, setTrafficSearch] = useState("");
+  useEffect(() => {
+    if (!data?.interfaces) return;
 
-  // Update bandwidth history when new data arrives
-  if (data?.interfaces) {
-    const now = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const now = new Date().toLocaleTimeString("en-GB", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
 
     data.interfaces.forEach((iface) => {
       if (!historyRef.current[iface.name]) {
         historyRef.current[iface.name] = [];
       }
-
-      const history = historyRef.current[iface.name];
-      history.push({
+      const txRate = parseInt(iface["tx-rate"], 10);
+      const rxRate = parseInt(iface["rx-rate"], 10);
+      const newPoint = {
         time: now,
-        tx: parseInt(iface["tx-rate"], 10) / 1_000_000, // convert to Mbps
-        rx: parseInt(iface["rx-rate"], 10) / 1_000_000,
-      });
-
-      // Keep only last MAX_HISTORY points
-      if (history.length > MAX_HISTORY) {
-        history.splice(0, history.length - MAX_HISTORY);
-      }
+        tx: isNaN(txRate) ? 0 : txRate / 1_000_000,
+        rx: isNaN(rxRate) ? 0 : rxRate / 1_000_000,
+      };
+      historyRef.current[iface.name] = [
+        ...historyRef.current[iface.name],
+        newPoint,
+      ].slice(-MAX_HISTORY);
     });
 
-    // Auto-select first running interface if none selected
     if (!selectedIface && data.interfaces.length > 0) {
-      const firstRunning = data.interfaces.find((i) => i.running === "true" && i.disabled === "false");
+      const firstRunning = data.interfaces.find(
+        (i) => i.running === "true" && i.disabled === "false"
+      );
       if (firstRunning) setSelectedIface(firstRunning.name);
     }
-  }
 
-  // Filtered clients based on search input
-  const filteredLeases: MikroTikDhcpLease[] = (data?.leases ?? []).filter((l) => {
+    forceUpdate((n) => n + 1);
+  }, [data]);
+
+  // Sort interfaces by total TX bytes descending, split active/inactive
+  const allInterfaces = data?.interfaces ?? [];
+  const activeInterfaces = allInterfaces
+    .filter((i) => i.running === "true" && i.disabled === "false")
+    .sort((a, b) => parseInt(b["tx-byte"], 10) - parseInt(a["tx-byte"], 10));
+  const inactiveInterfaces = allInterfaces.filter(
+    (i) => i.running !== "true" || i.disabled === "true"
+  );
+  const displayedInterfaces = showInactive
+    ? [...activeInterfaces, ...inactiveInterfaces]
+    : activeInterfaces;
+
+  // Max TX bytes across active interfaces — used to scale bars
+  const maxTxBytes = activeInterfaces.reduce(
+    (max, i) => Math.max(max, parseInt(i["tx-byte"], 10) || 0),
+    1
+  );
+
+  const sparklineData = selectedIface
+    ? historyRef.current[selectedIface] ?? []
+    : [];
+
+  // Clients
+  const boundCount = (data?.leases ?? []).filter((l) => l.status === "bound").length;
+  const filteredLeases = (data?.leases ?? []).filter((l) => {
     const q = clientSearch.toLowerCase();
     return (
       l.address.includes(q) ||
@@ -224,187 +287,226 @@ export default function NetworkDashboard() {
       l["mac-address"].toLowerCase().includes(q)
     );
   });
+  const grouped = groupBySubnet(filteredLeases);
+  const subnets = Object.keys(grouped).sort();
 
-  // Filtered accounting entries — only show top 50 by bytes, then filter
-  const filteredAccounting: MikroTikAccountingEntry[] = (data?.accounting ?? [])
-    .sort((a, b) => parseInt(b.bytes, 10) - parseInt(a.bytes, 10))
-    .slice(0, 50)
-    .filter((e) => {
-      const q = trafficSearch.toLowerCase();
-      return e.src.includes(q) || e.dst.includes(q);
-    });
-
-  const sparklineData = selectedIface ? (historyRef.current[selectedIface] ?? []) : [];
-  const boundClients = (data?.leases ?? []).filter((l) => l.status === "bound").length;
+  const cpuLoad = data?.system["cpu-load"] ?? "0";
+  const cpuNum = parseInt(cpuLoad, 10);
+  const cpuAccent =
+    cpuNum >= 80
+      ? "text-red-500"
+      : cpuNum >= 50
+      ? "text-amber-500"
+      : "text-emerald-500";
 
   return (
     <main className="min-h-screen bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100">
-      {/* Header */}
-      <div className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-6 py-4 flex items-center justify-between">
-        <div>
-          <h1 className="text-lg font-semibold">Network Monitor</h1>
-          <p className="text-xs text-zinc-500 mt-0.5">
-            {lastUpdated ? `Last updated: ${new Date(lastUpdated).toLocaleTimeString()}` : "Waiting for data..."}
-          </p>
+
+      {/* Minimal header */}
+      <div className="bg-white dark:bg-zinc-900 border-b border-zinc-100 dark:border-zinc-800 px-6 py-3 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-medium">Network Monitor</span>
+          <span className="text-xs text-zinc-300 dark:text-zinc-600">·</span>
+          <span className="text-xs text-zinc-400">
+            {data?.system["board-name"] ?? "—"}
+          </span>
         </div>
-        <StatusBadge status={status} />
+        <div className="flex items-center gap-4">
+          {lastUpdated && (
+            <span className="text-xs text-zinc-400 hidden sm:block">
+              {new Date(lastUpdated).toLocaleTimeString()}
+            </span>
+          )}
+          <StatusDot status={status} />
+        </div>
       </div>
 
-      {/* Error banner — only shows on SSE-level errors */}
-      {error && status !== "connected" && (
-        <div className="bg-red-50 dark:bg-red-950 border-b border-red-200 dark:border-red-800 px-6 py-3 text-sm text-red-700 dark:text-red-300">
-          {error}
+      <div className="px-6 py-6 space-y-6">
+
+        {/* --- Row 1: Metric cards --- */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <MetricCard
+            label="Uptime"
+            value={formatUptime(data?.system.uptime ?? "")}
+          />
+          <MetricCard
+            label="CPU Load"
+            value={data ? `${cpuLoad}%` : "—"}
+            accent={cpuAccent}
+          />
+          <MetricCard
+            label="Memory"
+            value={data ? formatBytes(parseInt(data.system["total-memory"], 10) - parseInt(data.system["free-memory"], 10)) : "—"}
+            sub={data ? formatMemory(data.system["free-memory"], data.system["total-memory"]) : undefined}
+          />
+          <MetricCard
+            label="Clients"
+            value={data ? `${boundCount}` : "—"}
+            sub="bound leases"
+          />
         </div>
-      )}
 
-      <div className="max-w-7xl mx-auto px-4 md:px-6 py-6 space-y-6">
+        {/* --- Row 2: Interfaces + Sparkline --- */}
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
 
-        {/* --- Section 1: System Overview --- */}
-        <section>
-          <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wide mb-3">System</h2>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <StatCard
-              label="Board"
-              value={data?.system["board-name"] ?? "—"}
-            />
-            <StatCard
-              label="Uptime"
-              value={formatUptime(data?.system.uptime ?? "")}
-            />
-            <StatCard
-              label="CPU Load"
-              value={data ? `${data.system["cpu-load"]}%` : "—"}
-              valueClass={cpuColor(data?.system["cpu-load"] ?? "0")}
-            />
-            <StatCard
-              label="Free Memory"
-              value={
-                data
-                  ? `${formatBytes(data.system["free-memory"])} / ${formatBytes(data.system["total-memory"])}`
-                  : "—"
-              }
-            />
-          </div>
-        </section>
-
-        {/* --- Section 2: Interfaces + Sparkline --- */}
-        <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {/* Interface list */}
-          <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wide">Interfaces</h2>
-              <span className="text-xs text-zinc-400">{data?.interfaces.length ?? 0} total</span>
-            </div>
-            <div className="divide-y divide-zinc-100 dark:divide-zinc-800">
-              {(data?.interfaces ?? []).map((iface) => (
-                <div
-                  key={iface[".id"]}
-                  className={`cursor-pointer rounded-lg transition-colors ${selectedIface === iface.name ? "bg-zinc-50 dark:bg-zinc-800" : ""}`}
-                  onClick={() => setSelectedIface(iface.name)}
-                >
-                  <InterfaceRow iface={iface} />
-                </div>
-              ))}
-              {!data && <p className="text-sm text-zinc-400 py-4 text-center">Connecting...</p>}
-            </div>
-          </div>
-
-          {/* Bandwidth sparkline for selected interface */}
-          <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wide">
-                Bandwidth — <span className="text-zinc-900 dark:text-zinc-100">{selectedIface ?? "select interface"}</span>
-              </h2>
-              <span className="text-xs text-zinc-400">last {MAX_HISTORY} polls</span>
-            </div>
-            {sparklineData.length > 1 ? (
-              <ResponsiveContainer width="100%" height={200}>
-                <AreaChart data={sparklineData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="txGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
-                      <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                    </linearGradient>
-                    <linearGradient id="rxGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#22c55e" stopOpacity={0.3} />
-                      <stop offset="95%" stopColor="#22c55e" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <XAxis dataKey="time" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
-                  <YAxis tick={{ fontSize: 10 }} tickFormatter={(v) => `${v.toFixed(1)}M`} width={55} />
-                  <Tooltip
-                    formatter={(value: number, name: string) => [`${value.toFixed(3)} Mbps`, name.toUpperCase()]}
-                    labelStyle={{ fontSize: 11 }}
-                    contentStyle={{ fontSize: 12 }}
-                  />
-                  <Area type="monotone" dataKey="tx" stroke="#3b82f6" fill="url(#txGrad)" strokeWidth={1.5} dot={false} name="tx" />
-                  <Area type="monotone" dataKey="rx" stroke="#22c55e" fill="url(#rxGrad)" strokeWidth={1.5} dot={false} name="rx" />
-                </AreaChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="h-[200px] flex items-center justify-center text-sm text-zinc-400">
-                {selectedIface ? "Collecting data..." : "Click an interface to view bandwidth"}
+          {/* Interfaces ranked by traffic */}
+          <div className="bg-white dark:bg-zinc-900 border border-zinc-100 dark:border-zinc-800 rounded-xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-zinc-50 dark:border-zinc-800 flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-medium">Interfaces</h2>
+                <p className="text-[11px] text-zinc-400 mt-0.5">
+                  {activeInterfaces.length} active · ranked by total TX
+                </p>
               </div>
-            )}
-            {/* Legend */}
-            <div className="flex gap-4 mt-2 text-xs text-zinc-500">
-              <span className="flex items-center gap-1.5">
-                <span className="w-3 h-0.5 bg-blue-500 inline-block" /> TX
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="w-3 h-0.5 bg-green-500 inline-block" /> RX
-              </span>
+              <button
+                onClick={() => setShowInactive((v) => !v)}
+                className="text-[11px] text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors"
+              >
+                {showInactive
+                  ? `hide inactive (${inactiveInterfaces.length})`
+                  : `show inactive (${inactiveInterfaces.length})`}
+              </button>
+            </div>
+            <div className="px-2 py-2 max-h-96 overflow-y-auto">
+              {displayedInterfaces.length > 0 ? (
+                displayedInterfaces.map((iface) => (
+                  <InterfaceBar
+                    key={iface[".id"]}
+                    iface={iface}
+                    maxBytes={maxTxBytes}
+                    isSelected={selectedIface === iface.name}
+                    onClick={() => setSelectedIface(iface.name)}
+                  />
+                ))
+              ) : (
+                <p className="text-sm text-zinc-400 py-6 text-center">Connecting...</p>
+              )}
             </div>
           </div>
-        </section>
 
-        {/* --- Section 3: Connected Clients --- */}
-        <section className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl p-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
+          {/* Bandwidth chart */}
+          <div className="bg-white dark:bg-zinc-900 border border-zinc-100 dark:border-zinc-800 rounded-xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-zinc-50 dark:border-zinc-800">
+              <h2 className="text-sm font-medium">
+                Bandwidth
+                {selectedIface && (
+                  <span className="font-normal text-zinc-400 ml-2">— {selectedIface}</span>
+                )}
+              </h2>
+              <p className="text-[11px] text-zinc-400 mt-0.5">last {MAX_HISTORY} polls · 5s interval</p>
+            </div>
+            <div className="p-4">
+              {sparklineData.length > 1 ? (
+                <ResponsiveContainer width="100%" height={240}>
+                  <AreaChart data={sparklineData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="txG" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#60a5fa" stopOpacity={0.2} />
+                        <stop offset="95%" stopColor="#60a5fa" stopOpacity={0} />
+                      </linearGradient>
+                      <linearGradient id="rxG" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#a78bfa" stopOpacity={0.2} />
+                        <stop offset="95%" stopColor="#a78bfa" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <XAxis
+                      dataKey="time"
+                      tick={{ fontSize: 10, fill: "#a1a1aa" }}
+                      interval="preserveStartEnd"
+                      axisLine={false}
+                      tickLine={false}
+                    />
+                    <YAxis
+                      tick={{ fontSize: 10, fill: "#a1a1aa" }}
+                      tickFormatter={(v) => `${v.toFixed(1)}M`}
+                      width={52}
+                      axisLine={false}
+                      tickLine={false}
+                    />
+                    <Tooltip
+                      formatter={(value) => [`${Number(value).toFixed(3)} Mbps`]}
+                      contentStyle={{
+                        fontSize: 12,
+                        border: "0.5px solid #e4e4e7",
+                        borderRadius: 8,
+                        background: "white",
+                        color: "#18181b",
+                      }}
+                      labelStyle={{ fontSize: 11, color: "#a1a1aa" }}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="tx"
+                      stroke="#60a5fa"
+                      fill="url(#txG)"
+                      strokeWidth={1.5}
+                      dot={false}
+                      name="TX"
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="rx"
+                      stroke="#a78bfa"
+                      fill="url(#rxG)"
+                      strokeWidth={1.5}
+                      dot={false}
+                      name="RX"
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="h-60 flex items-center justify-center text-sm text-zinc-400">
+                  {selectedIface ? "Collecting data..." : "Click an interface to view bandwidth"}
+                </div>
+              )}
+              <div className="flex gap-4 mt-1 text-xs text-zinc-400">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-3 h-px bg-blue-400 inline-block" /> TX
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-3 h-px bg-violet-400 inline-block" /> RX
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* --- Row 3: Connected Clients --- */}
+        <div className="bg-white dark:bg-zinc-900 border border-zinc-100 dark:border-zinc-800 rounded-xl overflow-hidden">
+          <div className="px-4 py-3 border-b border-zinc-50 dark:border-zinc-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
-              <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wide">Connected Clients</h2>
-              <p className="text-xs text-zinc-400 mt-0.5">{boundClients} bound leases</p>
+              <h2 className="text-sm font-medium">Connected Clients</h2>
+              <p className="text-[11px] text-zinc-400 mt-0.5">{boundCount} bound · grouped by subnet</p>
             </div>
             <input
               type="text"
-              placeholder="Filter by IP, hostname, or MAC..."
+              placeholder="Search IP, hostname, MAC..."
               value={clientSearch}
               onChange={(e) => setClientSearch(e.target.value)}
-              className="text-sm border border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-1.5 bg-zinc-50 dark:bg-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-400 w-full sm:w-64"
+              className="text-sm border border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-1.5 bg-zinc-50 dark:bg-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-300 dark:focus:ring-zinc-600 w-full sm:w-56 text-zinc-700 dark:text-zinc-300 placeholder:text-zinc-400"
             />
           </div>
-          <div>
-            {filteredLeases.length > 0
-              ? filteredLeases.map((lease) => <LeaseRow key={lease[".id"]} lease={lease} />)
-              : <p className="text-sm text-zinc-400 py-4 text-center">{data ? "No clients found" : "Connecting..."}</p>
-            }
-          </div>
-        </section>
 
-        {/* --- Section 4: Traffic per IP --- */}
-        <section className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl p-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
-            <div>
-              <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wide">Traffic per IP</h2>
-              <p className="text-xs text-zinc-400 mt-0.5">Top 50 by bytes — accounting snapshot</p>
-            </div>
-            <input
-              type="text"
-              placeholder="Filter by source or destination IP..."
-              value={trafficSearch}
-              onChange={(e) => setTrafficSearch(e.target.value)}
-              className="text-sm border border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-1.5 bg-zinc-50 dark:bg-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-400 w-full sm:w-64"
-            />
-          </div>
-          <div>
-            {filteredAccounting.length > 0
-              ? filteredAccounting.map((entry, idx) => <AccountingRow key={idx} entry={entry} />)
-              : <p className="text-sm text-zinc-400 py-4 text-center">
-                  {data ? "No traffic data — is /ip accounting enabled?" : "Connecting..."}
-                </p>
-            }
-          </div>
-        </section>
+          {subnets.length > 0 ? (
+            subnets.map((subnet) => (
+              <div key={subnet}>
+                <div className="px-4 py-1.5 bg-zinc-50 dark:bg-zinc-800/50 border-b border-zinc-100 dark:border-zinc-800 flex items-center justify-between">
+                  <span className="text-[11px] font-medium text-zinc-500 font-mono">{subnet}.0/24</span>
+                  <span className="text-[11px] text-zinc-400">{grouped[subnet].length} hosts</span>
+                </div>
+                <div className="px-4">
+                  {grouped[subnet].map((lease) => (
+                    <ClientRow key={lease[".id"]} lease={lease} />
+                  ))}
+                </div>
+              </div>
+            ))
+          ) : (
+            <p className="text-sm text-zinc-400 py-6 text-center px-4">
+              {data ? "No clients found" : "Connecting..."}
+            </p>
+          )}
+        </div>
 
       </div>
     </main>
